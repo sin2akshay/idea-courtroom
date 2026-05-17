@@ -298,31 +298,35 @@ Return ONLY a valid JSON object. No markdown fences. No preamble.
 
 ## Setup
 
-### Option A — Run as Claude Artifact (Recommended for Demo)
-Open `idea_courtroom.jsx` inside Claude.ai as an artifact. No API key needed.
+Three terminals. This is the full stack — llm_gatewayV2 underneath, FastAPI in the middle, React on top.
 
-### Option B — Run with Python Backend + llm_gatewayV2
+### Terminal 1 — llm_gatewayV2 (free LLM providers)
 ```bash
-# Clone the repo
-git clone https://github.com/sin2akshay/idea-courtroom
-cd idea-courtroom
+cd path/to/llm_gatewayV2
+cp .env.example .env   # add your provider keys (Gemini, Groq, etc.)
+python main.py
+# Running on http://localhost:8100
+```
 
-# Set up Python backend with uv
-uv init backend
+### Terminal 2 — Python backend
+```bash
 cd backend
-uv add fastapi uvicorn httpx
-
-# Configure your .env (see llm_gatewayV2 docs)
-cp .env.example .env
-
-# Run the backend
+uv sync                # installs fastapi, uvicorn, httpx, pydantic
 uv run uvicorn main:app --reload --port 8200
+# Running on http://localhost:8200
+```
 
-# Run the React frontend
-cd ../frontend
+### Terminal 3 — React frontend
+```bash
+cd frontend
 npm install
 npm run dev
+# Running on http://localhost:5173
 ```
+
+The frontend shows a **gateway status badge** — green when the backend is up, red with terminal instructions if not.
+
+> **Quick demo alternative:** Open `idea_courtroom.jsx` (the Anthropic API version) as a Claude.ai artifact — no setup required, useful for testing the UI before wiring the gateway.
 
 See `ARCHITECTURE.md` for the full technical breakdown and Session 5 alignment.
 
@@ -332,17 +336,16 @@ See `ARCHITECTURE.md` for the full technical breakdown and Session 5 alignment.
 
 ```
 idea-courtroom/
-├── idea_courtroom.jsx      # Standalone artifact version (claude.ai)
-├── README.md               # This file
-├── ARCHITECTURE.md         # Full technical breakdown + Session 5 alignment
-├── backend/                # Python FastAPI + llm_gatewayV2 (option B)
-│   ├── main.py
-│   ├── prompts.py
-│   ├── schemas.py          # Pydantic models for each voice
-│   └── pyproject.toml
-└── frontend/               # React app for standalone deployment
-    └── src/
-        └── App.jsx
+├── idea_courtroom.jsx             # Claude.ai artifact version (Anthropic API, no setup)
+├── idea_courtroom_gateway.jsx     # Full version — React frontend calling FastAPI backend
+├── README.md                      # This file
+├── ARCHITECTURE.md                # Full technical breakdown + Session 5 alignment
+└── backend/                       # Python FastAPI + llm_gatewayV2
+    ├── pyproject.toml             # uv project file — uv sync to install
+    ├── main.py                    # FastAPI app — /api/phase1, /api/phase2, /api/phase3
+    ├── courtroom.py               # Dependency-aware reasoning chain (the agent logic)
+    ├── schemas.py                 # Pydantic models for all 4 voices (one source of truth)
+    └── prompts.py                 # Rubric-qualified system prompts
 ```
 
 ---

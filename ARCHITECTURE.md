@@ -8,37 +8,41 @@ A full technical breakdown of The Idea Courtroom — how it works, how the LLM c
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Browser (React)                          │
+│                React Frontend  (localhost:5173)                 │
+│  idea_courtroom_gateway.jsx                                     │
 │                                                                 │
-│   User types idea                                               │
-│        │                                                        │
-│        ▼                                                        │
-│   ┌──────────────────────────────────────────────────────────┐  │
-│   │              Dependency-Aware Reasoning Chain            │  │
-│   │                                                          │  │
-│   │  PHASE 1 (parallel — no dependencies)                    │  │
-│   │  ┌─────────────────┐   ┌─────────────────┐              │  │
-│   │  │   Advocate LLM  │   │  Prosecutor LLM │              │  │
-│   │  │   Call #1       │   │  Call #2        │              │  │
-│   │  └────────┬────────┘   └────────┬────────┘              │  │
-│   │           │                     │                         │  │
-│   │           └──────────┬──────────┘                         │  │
-│   │                      ▼                                    │  │
-│   │  PHASE 2 (depends on Phase 1 output)                     │  │
-│   │           ┌─────────────────┐                            │  │
-│   │           │  Strategist LLM │                            │  │
-│   │           │  Call #3        │                            │  │
-│   │           └────────┬────────┘                            │  │
-│   │                    │                                      │  │
-│   │                    ▼                                      │  │
-│   │  PHASE 3 (depends on Phases 1 + 2)                       │  │
-│   │           ┌─────────────────┐                            │  │
-│   │           │    Judge LLM    │                            │  │
-│   │           │    Call #4      │                            │  │
-│   │           └────────┬────────┘                            │  │
-│   └────────────────────┼─────────────────────────────────────┘  │
-│                        ▼                                        │
-│                  Verdict Card (UI)                              │
+│  User types idea → POST /api/phase1 → POST /api/phase2         │
+│                                      → POST /api/phase3         │
+└────────────────────────┬────────────────────────────────────────┘
+                         │  HTTP (localhost:8200)
+┌────────────────────────▼────────────────────────────────────────┐
+│             FastAPI Backend  (localhost:8200)                   │
+│  backend/main.py + courtroom.py                                 │
+│                                                                 │
+│  PHASE 1 (parallel)                                             │
+│  ┌─────────────────┐   ┌─────────────────┐                     │
+│  │  run_advocate() │   │ run_prosecutor() │ asyncio.gather      │
+│  └────────┬────────┘   └────────┬────────┘                     │
+│           └──────────┬──────────┘                               │
+│                      ▼                                          │
+│  PHASE 2 (depends on Phase 1)                                   │
+│           ┌─────────────────┐                                   │
+│           │ run_strategist()│                                   │
+│           └────────┬────────┘                                   │
+│                    ▼                                            │
+│  PHASE 3 (depends on Phases 1 + 2)                              │
+│           ┌─────────────────┐                                   │
+│           │   run_judge()   │  reasoning="high"                 │
+│           └────────┬────────┘                                   │
+└────────────────────┼────────────────────────────────────────────┘
+                     │  HTTP (localhost:8100)
+┌────────────────────▼────────────────────────────────────────────┐
+│          llm_gatewayV2  (localhost:8100)                        │
+│                                                                 │
+│  Single OpenAI-style API → 7 free providers                     │
+│  Auto-failover · reasoning knob · cache_system · json_schema    │
+│                                                                 │
+│  Gemini · Groq · Cerebras · NVIDIA NIM · OpenRouter · Ollama   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -46,45 +50,67 @@ A full technical breakdown of The Idea Courtroom — how it works, how the LLM c
 
 ## How the LLM Calls Actually Work
 
-### Inside claude.ai (Artifact Mode)
+Every LLM call in this app flows through `courtroom.py` → `call_gateway()` → llm_gatewayV2 → one of 7 free providers.
 
-When `idea_courtroom.jsx` runs as an artifact inside claude.ai, every `fetch` call to `api.anthropic.com` is intercepted and authenticated by Anthropic's infrastructure. **No API key appears in the code and no API key is needed from you.** The call is handled server-side.
+### The single gateway entry point (`courtroom.py`)
 
-```js
-// This is the ENTIRE API call. No Authorization header, no key.
-const response = await fetch("https://api.anthropic.com/v1/messages", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 1500,
-    system: VOICE_PROMPT,
-    messages: [{ role: "user", content: userMessage }],
-  })
-});
+```python
+async def call_gateway(
+    system_prompt: str,
+    user_message: str,
+    response_model: type[BaseModel],
+    reasoning: str = "medium",
+    cache_system: bool = True,
+) -> dict:
+    payload = {
+        "model": "auto",              # gateway picks best available provider
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_message},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "schema": response_model.model_json_schema(), # Pydantic generates this
+            "name": response_model.__name__,
+            "strict": True,
+        },
+        "reasoning": reasoning,       # V2 extension: translated per provider
+        "cache_system": cache_system, # V2 extension: caches stable system prompts
+    }
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        response = await client.post("http://localhost:8100/v1/chat/completions", json=payload)
+    data = response.json()
+    return data["choices"][0]["message"]["parsed"]  # gateway returns validated dict
 ```
 
-This capability exists **only inside the claude.ai artifact sandbox**. It is not a general browser capability.
+### Using Rohan's Python client (alternative to httpx)
 
-### If You Deploy It Yourself (Standalone Web App)
+If you copy `client.py` from the `llm_gatewayV2/` directory into `backend/`, you can use the native client instead:
 
-Direct browser → Anthropic API calls will fail in two ways:
-1. **No API key** — the request will be rejected with a 401
-2. **CORS** — browsers block cross-origin requests to `api.anthropic.com` from third-party domains
+```python
+from client import LLM
+llm = LLM()
 
-The correct architecture for standalone deployment is:
-
+reply = llm.chat(
+    system=ADVOCATE_PROMPT,
+    prompt=f"IDEA:\n{idea}",
+    cache_system=True,
+    reasoning="medium",
+    response_format={
+        "type": "json_schema",
+        "schema": AdvocacyCase.model_json_schema(),
+        "name": "AdvocacyCase",
+        "strict": True,
+    }
+)
+result = AdvocacyCase.model_validate(reply["parsed"])
 ```
-React (browser)  →  Your Python Backend  →  Anthropic API (or llm_gatewayV2)
-```
 
-Your backend holds the API key, proxies the request, and returns the response. The browser never touches the API directly.
+Both approaches produce identical results. The `httpx` version in `courtroom.py` is self-contained — no need to copy files from the gateway directory.
 
-### Will Publishing the Artifact Cost You API Credits?
+### API key situation
 
-**No.** When other people open your claude.ai artifact link, they run it in their own claude.ai session under Anthropic's infrastructure. Your personal API usage is not affected.
-
-However: if you build a standalone web app with your own API key exposed on the frontend, every user's request costs you money. Never hardcode API keys in frontend code.
+llm_gatewayV2 handles all provider authentication via its own `.env` file (Gemini API key, Groq API key, etc.). The FastAPI backend has no key of its own — it just calls `localhost:8100`. The React frontend has no key at all — it calls `localhost:8200`. **No API key ever appears in frontend code.**
 
 ---
 
@@ -264,115 +290,17 @@ llm.chat(prompt=..., reasoning="high")     # Judge (verifier role)
 
 ---
 
-## The llm_gatewayV2 Integration Path
-
-The Idea Courtroom can be fully migrated to use `llm_gatewayV2` (Session 5's preferred gateway) via a Python backend. Here's what that looks like:
-
-### Python Backend (FastAPI + uv)
-
-```python
-# backend/schemas.py — Pydantic models (one source of truth)
-from pydantic import BaseModel, Field
-from typing import Literal
-
-class AdvocacyCase(BaseModel):
-    problem: str
-    audience: str
-    timing: str
-    wedge: str
-    unfair_advantage: str
-    strongest_signal: str
-
-class FinalVerdict(BaseModel):
-    conviction_score: int = Field(ge=0, le=10)
-    recommended_path: Literal["PROCEED", "PIVOT", "PASS"]
-    strongest_signal: str
-    biggest_risk: str
-    next_action: str
-    one_line_pitch: str
-```
-
-```python
-# backend/main.py — FastAPI routes calling llm_gatewayV2
-import asyncio
-from fastapi import FastAPI
-from client import LLM  # llm_gatewayV2 client
-
-app = FastAPI()
-llm = LLM()  # auto-failover across 7 free providers
-
-@app.post("/trial")
-async def run_trial(idea: str):
-    # Phase 1 — Parallel (asyncio.TaskGroup)
-    async with asyncio.TaskGroup() as tg:
-        advocate_task = tg.create_task(
-            llm.chat(prompt=ADVOCATE_PROMPT + idea, reasoning="medium")
-        )
-        prosecutor_task = tg.create_task(
-            llm.chat(prompt=PROSECUTOR_PROMPT + idea, reasoning="medium")
-        )
-
-    adv = AdvocacyCase.model_validate(advocate_task.result()["parsed"])
-    pros = ProsecutionCase.model_validate(prosecutor_task.result()["parsed"])
-
-    # Phase 2 — Strategist
-    strat_raw = await llm.chat(
-        prompt=f"{STRATEGIST_PROMPT}\n{adv.model_dump_json()}\n{pros.model_dump_json()}",
-        reasoning="medium"
-    )
-    strat = StrategicAnalysis.model_validate(strat_raw["parsed"])
-
-    # Phase 3 — Judge (verifier)
-    verdict_raw = await llm.chat(
-        prompt=f"{JUDGE_PROMPT}\n{adv.model_dump_json()}\n{pros.model_dump_json()}\n{strat.model_dump_json()}",
-        reasoning="high",
-        response_format={
-            "type": "json_schema",
-            "schema": FinalVerdict.model_json_schema(),
-            "name": "FinalVerdict",
-            "strict": True,
-        }
-    )
-    return FinalVerdict.model_validate(verdict_raw["parsed"])
-```
-
-### Updated Dependency Graph with Backend
-
-```
-React (browser)
-      │  POST /trial {idea: "..."}
-      ▼
-FastAPI Backend (port 8200)
-      │
-      ├──── asyncio.TaskGroup ──── llm_gatewayV2 (port 8100) → Groq / Gemini
-      │     ├── Advocate call
-      │     └── Prosecutor call
-      │
-      ├──── Strategist call ───── llm_gatewayV2 (port 8100) → Gemini / Cerebras
-      │
-      └──── Judge call ────────── llm_gatewayV2 (port 8100) → Groq / NVIDIA NIM
-                │
-                ▼
-           FinalVerdict (Pydantic validated)
-                │
-      ◄─────────┘
-React renders Verdict Card
-```
-
-This is 100% aligned with `agent5.py` — same gateway, same Pydantic validation, same `asyncio.TaskGroup` parallel dispatch, same reasoning knob, same structured output verifier pattern.
-
----
-
 ## File Reference
 
-| File | Purpose |
-|---|---|
-| `idea_courtroom.jsx` | Standalone React artifact — runs in claude.ai with no setup |
-| `README.md` | Setup, prompts, test output, session alignment table |
-| `ARCHITECTURE.md` | This file — full technical breakdown |
-| `backend/schemas.py` | Pydantic models for all four voices |
-| `backend/main.py` | FastAPI + llm_gatewayV2 integration |
-| `backend/prompts.py` | All four system prompts as Python constants |
+| File | Purpose | Session 5 concept |
+|---|---|---|
+| `backend/schemas.py` | Pydantic models for all 4 voices | Structured output, one source of truth |
+| `backend/prompts.py` | Rubric-qualified system prompts | Instructional framing, self-checks |
+| `backend/courtroom.py` | Dependency chain + `call_gateway()` | `asyncio.gather`, typed step I/O, `reasoning=` knob |
+| `backend/main.py` | FastAPI with per-phase endpoints | Clean API boundaries, error handling |
+| `backend/pyproject.toml` | uv project file | Session 5 package management |
+| `idea_courtroom_gateway.jsx` | React frontend → FastAPI → gateway | Progressive UI, parallel phase display |
+| `idea_courtroom.jsx` | Claude.ai artifact (Anthropic API) | Quick demo, no setup required |
 
 ---
 
@@ -380,8 +308,8 @@ This is 100% aligned with `agent5.py` — same gateway, same Pydantic validation
 
 1. **The dependency chain IS the architecture.** What runs first, what runs second, and what depends on what is not incidental — it's the design.
 
-2. **Structured output is not a nice-to-have.** Every LLM output in this app is validated before it's used as input to the next step. One bad output propagates clean errors, not corrupted reasoning chains.
+2. **Structured output is not a nice-to-have.** Every LLM output is validated before it becomes the next step's input. One bad output raises a clean `ValidationError`, not a corrupted reasoning chain.
 
-3. **The session's concepts are language-agnostic.** `Promise.all` is `asyncio.TaskGroup`. A JSON schema in a prompt is a Pydantic `BaseModel`. The patterns are the same regardless of language.
+3. **The session's concepts are language-agnostic.** `Promise.all` in the React frontend mirrors `asyncio.gather` in the backend. A JSON schema in a prompt is a Pydantic `BaseModel`. The patterns transfer across languages.
 
-4. **The llm_gatewayV2 is a drop-in backend.** The React frontend doesn't care whether it's calling Anthropic directly or a gateway — it just calls an endpoint and receives validated JSON.
+4. **The gateway is the right abstraction.** The React frontend doesn't know or care which LLM provider answered — it just receives validated JSON from the backend. Swap Groq for Gemini in the gateway config, nothing else changes.
